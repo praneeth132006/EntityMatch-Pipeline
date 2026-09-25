@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,35 @@ FEATURES = [
     "name_address_minimum", "retrieval_score",
 ]
 ROOT = Path(__file__).resolve().parents[1]
+TRAIN_OPTIONS = ("sample_mod", "sample_keep", "top_k", "block_cap", "iterations", "threads", "data_label")
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_inputs(data, splits=("train", "test")):
+    """Fail before indexing a large corpus if any required input is missing."""
+    for split in splits:
+        names = [f"{split}_source{i}.tsv" for i in (1, 2, 3)]
+        if split == "train":
+            names.append("train_ground_truth.tsv")
+        for name in names:
+            path = Path(data) / split / name
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError(f"Missing or empty input file: {path}")
+
+
+def check_training_options(args):
+    for key in TRAIN_OPTIONS[:-1]:
+        if not isinstance(getattr(args, key), int) or getattr(args, key) < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if args.sample_keep > args.sample_mod:
+        raise ValueError("sample_keep cannot exceed sample_mod")
 
 
 def stable_hash(text: str) -> int:
@@ -46,11 +76,18 @@ def build(work: Path) -> Path:
     if sys.byteorder != "little":
         raise RuntimeError("Candidate protocol requires a little-endian machine")
     work.mkdir(parents=True, exist_ok=True)
-    binary = work / "retrieve"
+    binary = (work / "retrieve").resolve()
     source = ROOT / "src" / "retrieve.cpp"
-    if not binary.exists() or binary.stat().st_mtime < source.stat().st_mtime:
-        compiler = os.environ.get("CXX", "c++")
-        subprocess.run([compiler, "-O3", "-std=c++17", str(source), "-o", str(binary)], check=True)
+    compiler = os.environ.get("CXX", "c++")
+    stamp = work / "retrieve_build.json"
+    expected = {"source_sha256": sha256_file(source), "compiler": compiler,
+                "flags": ["-O3", "-std=c++17"]}
+    previous = json.loads(stamp.read_text()) if stamp.exists() else None
+    if not binary.exists() or previous != expected:
+        temporary = binary.with_suffix(".tmp")
+        subprocess.run([compiler, *expected["flags"], str(source), "-o", str(temporary)], check=True)
+        temporary.replace(binary)
+        dump_json(stamp, expected)
     return binary
 
 
@@ -72,17 +109,21 @@ def read_string(stream):
     return read_exact(stream, size).decode("utf-8")
 
 
-def retrieve(data: Path, split: str, work: Path, top_k: int, sample_mod=1, sample_keep=1, block_cap=64):
+def retrieve(data: Path, split: str, work: Path, top_k: int, sample_mod=1, sample_keep=1, block_cap=64, stats=None):
     command = [str(build(work)), str(data / split), split, str(top_k),
                str(sample_mod), str(sample_keep), str(block_cap)]
     process = subprocess.Popen(command, stdout=subprocess.PIPE)
     try:
         stream = process.stdout
-        if read_exact(stream, 8) != b"EMATCH01":
+        if read_exact(stream, 8) != b"EMATCH02":
             raise RuntimeError("Invalid retrieval protocol")
         rows, n_features = read_u32(stream), read_u32(stream)
         if n_features != len(FEATURES):
             raise RuntimeError("Feature schema mismatch")
+        reference_count, target_count, preliminary_pairs = struct.unpack("<QQQ", read_exact(stream, 24))
+        if stats is not None:
+            stats.update(reference_count=reference_count, target_count=target_count,
+                         preliminary_pairs=preliminary_pairs, selected_references=rows)
         for _ in range(rows):
             entity, country, count = read_string(stream), read_string(stream), read_u32(stream)
             if count > top_k:
@@ -121,7 +162,8 @@ def choose_threshold(groups, labels, probabilities, true_counts, mask):
     if not np.any(mask):
         raise ValueError("Threshold split has no entities")
     best = (-1.0, 0.5)
-    for threshold in np.linspace(0.10, 0.995, 180):
+    # Include predict-all and predict-none; either can be optimal for singleton-heavy data.
+    for threshold in np.r_[0.0, np.linspace(0.10, 0.995, 180), np.nextafter(1.0, 2.0)]:
         score = float(score_entities(groups, labels, probabilities, true_counts, threshold)[mask].mean())
         if score >= best[0]:  # Conservative tie-break: prefer higher threshold.
             best = (score, float(threshold))
@@ -132,11 +174,7 @@ def input_manifest(data):
     manifest = {}
     for split in ("train", "test"):
         for path in sorted((data / split).glob("*.tsv")):
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-            manifest[f"{split}/{path.name}"] = {"bytes": path.stat().st_size, "sha256": digest.hexdigest()}
+            manifest[f"{split}/{path.name}"] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
     return manifest
 
 
@@ -144,9 +182,12 @@ def train(args):
     from catboost import CatBoostClassifier
     start = time.monotonic()
     work, data = Path(args.work_dir), Path(args.data_dir)
+    check_training_options(args)
+    check_inputs(data, ("train",))
+    retrieval_stats = {}
     refs, countries, targets, blocks, group_blocks = [], [], [], [], []
     for entity, country, ids, features in retrieve(data, "train", work, args.top_k,
-                                                  args.sample_mod, args.sample_keep, args.block_cap):
+                                                  args.sample_mod, args.sample_keep, args.block_cap, retrieval_stats):
         group_blocks.append(np.full(len(ids), len(refs), dtype=np.int32))
         refs.append(entity)
         countries.append(country)
@@ -155,6 +196,8 @@ def train(args):
     if not refs:
         raise ValueError("No sampled reference entities")
     ref_lookup = {entity: i for i, entity in enumerate(refs)}
+    if len(ref_lookup) != len(refs):
+        raise ValueError("Duplicate sampled reference IDs")
     truth = [None] * len(refs)
     with (data / "train" / "train_ground_truth.tsv").open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream, delimiter="\t")
@@ -205,6 +248,9 @@ def train(args):
                 "singleton_entities": int(((counts == 0) & mask).sum())}
     report = {
         "status": "measured held-out results, not leaderboard results",
+        "data_label": args.data_label,
+        "retrieval": retrieval_stats,
+        "candidate_reduction_ratio": 1 - len(y) / max(1, len(refs) * retrieval_stats["target_count"]),
         "sampled_entities": len(refs), "candidate_pairs": len(y), "positive_candidates": int(y.sum()),
         "threshold": threshold, "tuning_macro_f0_5": tuning_score,
         "holdout": describe(holdout),
@@ -236,11 +282,14 @@ def train(args):
     final_model.fit(x, y)
     final_model.save_model(str(work / "model.cbm"))
     report["elapsed_seconds"] = time.monotonic() - start
+    report["model_sha256"] = sha256_file(work / "model.cbm")
     dump_json(work / "model_config.json", {"threshold": threshold, "top_k": args.top_k,
               "block_cap": args.block_cap, "features": FEATURES, "parameters": parameters,
               "retriever_sha256": hashlib.sha256((ROOT / "src/retrieve.cpp").read_bytes()).hexdigest(),
               "model_sha256": hashlib.sha256((work / "model.cbm").read_bytes()).hexdigest()})
     dump_json(Path(args.report), report)
+    dump_json(work / "evaluation.json", report)
+    dump_json(work / "training_config.json", {"schema_version": 1, **{key: getattr(args, key) for key in TRAIN_OPTIONS}})
     dump_json(work / "input_manifest.json", input_manifest(data))
     print(json.dumps({"holdout": report["holdout"], "threshold": threshold}, indent=2))
 
@@ -248,6 +297,7 @@ def train(args):
 def predict(args):
     from catboost import CatBoostClassifier
     work, output = Path(args.work_dir), Path(args.output_dir)
+    check_inputs(Path(args.data_dir), ("test",))
     config = json.loads((work / "model_config.json").read_text())
     if config["features"] != FEATURES:
         raise ValueError("Model feature schema mismatch")
@@ -261,6 +311,7 @@ def predict(args):
     paths = [output / "matching_results.tsv", output / "candidate_pairs.tsv"]
     temporary = [path.with_suffix(".tsv.tmp") for path in paths]
     stats = {"entities": 0, "candidate_pairs": 0, "matched_pairs": 0, "by_country": {}}
+    retrieval_stats = {}
     with temporary[0].open("w", encoding="utf-8", newline="") as match, temporary[1].open("w", encoding="utf-8", newline="") as candidate:
         match.write("source1_entity_id\tmatched_entity_ids\n")
         candidate.write("source1_entity_id\tcandidate_entity_ids\n")
@@ -285,7 +336,7 @@ def predict(args):
                 stat["candidates"] += len(ids)
                 stat["matches"] += len(chosen)
             batch.clear()
-        for row in retrieve(Path(args.data_dir), "test", work, config["top_k"], block_cap=config["block_cap"]):
+        for row in retrieve(Path(args.data_dir), "test", work, config["top_k"], block_cap=config["block_cap"], stats=retrieval_stats):
             batch.append(row)
             if len(batch) >= 2048:
                 flush()
@@ -293,7 +344,13 @@ def predict(args):
     for temp, path in zip(temporary, paths):
         temp.replace(path)
     stats["average_candidates"] = stats["candidate_pairs"] / max(1, stats["entities"])
+    stats["retrieval"] = retrieval_stats
+    stats["candidate_reduction_ratio"] = 1 - stats["candidate_pairs"] / max(1, stats["entities"] * retrieval_stats["target_count"])
+    stats["model_sha256"] = config["model_sha256"]
+    stats["output_sha256"] = {path.name: sha256_file(path) for path in paths}
     dump_json(output / "prediction_stats.json", stats)
+    if not getattr(args, "preserve_expected_outputs", False):
+        dump_json(work / "expected_outputs.json", stats["output_sha256"])
     print(json.dumps(stats, indent=2))
 
 
@@ -350,54 +407,142 @@ def validate(args):
 
 
 def package(args):
-    output = Path(args.output_dir)
-    validation = output / "validation.json"
-    if not validation.exists() or json.loads(validation.read_text())["status"] != "PASS":
-        raise ValueError("Run validate successfully before packaging")
-    # Always revalidate current files; an old PASS report must not authorize changed outputs.
+    """Create a complete, auditable archive without replacing a good ZIP on failure."""
+    output, work = Path(args.output_dir), Path(args.work_dir)
     validate(args)
-    destination = Path(args.destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    methodology = ROOT / "Documentation_template.md"
+    methodology = Path(args.methodology or ROOT / "Documentation_template.md")
     if not methodology.exists() or "NOT YET RUN" in methodology.read_text():
         raise ValueError("Finalize the methodology with measured results before packaging")
-    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for name in ("matching_results.tsv", "candidate_pairs.tsv"):
-            archive.write(output / name, "output/" + name)
-        for path in sorted((ROOT / "src").glob("*")):
-            if path.is_file() and path.suffix in {".py", ".cpp"}:
-                archive.write(path, "code/business_entity_resolution/src/" + path.name)
-        for name in ("README.md", "requirements.txt", "requirements-lock.txt", "requirements-docs.txt", "LICENSE", "memory.md"):
-            archive.write(ROOT / name, "code/business_entity_resolution/" + name)
-        archive.write(methodology, "Documentation_template.md")
-        pdf = ROOT / "output" / "pdf" / "Approach.pdf"
-        if pdf.exists():
-            archive.write(pdf, "Approach.pdf")
-        for path in sorted((ROOT / "tests").glob("test_*.py")):
-            archive.write(path, "code/business_entity_resolution/tests/" + path.name)
-        archive.write(ROOT / "requirements-dev.txt", "code/business_entity_resolution/requirements-dev.txt")
+    artifact_names = ("model.cbm", "model_config.json", "training_config.json", "evaluation.json",
+                      "input_manifest.json", "expected_outputs.json")
+    for name in artifact_names:
+        if not (work / name).is_file():
+            raise ValueError(f"Missing reproducibility artifact: {work / name}")
+    config = json.loads((work / "model_config.json").read_text())
+    evaluation = json.loads((work / "evaluation.json").read_text())
+    stats_path = output / "prediction_stats.json"
+    stats = json.loads(stats_path.read_text())
+    if config["model_sha256"] != sha256_file(work / "model.cbm") or evaluation["model_sha256"] != config["model_sha256"] or stats["model_sha256"] != config["model_sha256"]:
+        raise ValueError("Model, evaluation, and predictions belong to different runs")
+    if config["retriever_sha256"] != sha256_file(ROOT / "src/retrieve.cpp"):
+        raise ValueError("Retriever changed since training; retrain before packaging")
+    expected = json.loads((work / "expected_outputs.json").read_text())
+    for name in ("matching_results.tsv", "candidate_pairs.tsv"):
+        if sha256_file(output / name) != expected.get(name) or expected.get(name) != stats["output_sha256"].get(name):
+            raise ValueError(f"Prediction artifact changed since model inference: {name}")
+    destination = Path(args.destination) if args.destination else output / "EntityMatch_submission.zip"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    inputs = [(output / name, "output/" + name) for name in ("matching_results.tsv", "candidate_pairs.tsv")]
+    prefix = "code/business_entity_resolution/"
+    inputs += [(path, prefix + "src/" + path.name) for path in sorted((ROOT / "src").glob("*")) if path.is_file() and path.suffix in {".py", ".cpp"}]
+    inputs += [(ROOT / name, prefix + name) for name in ("README.md", "requirements.txt", "requirements-lock.txt", "requirements-docs.txt", "requirements-dev.txt", "LICENSE", "memory.md")]
+    inputs += [(path, prefix + "tests/" + path.name) for path in sorted((ROOT / "tests").glob("test_*.py"))]
+    inputs += [(work / name, prefix + "artifacts/" + name) for name in artifact_names]
+    inputs += [(methodology, "Documentation_template.md"), (methodology, prefix + "Documentation_template.md"),
+               (stats_path, "reports/prediction_stats.json"), (output / "validation.json", "reports/validation.json"),
+               (work / "evaluation.json", "reports/evaluation.json")]
+    pdf = Path(args.approach_pdf) if args.approach_pdf else None
+    if pdf is not None:
+        if not pdf.is_file():
+            raise ValueError(f"Approach PDF does not exist: {pdf}")
+        inputs.append((pdf, "Approach.pdf"))
+    if any(destination.resolve() == path.resolve() for path, _ in inputs):
+        raise ValueError("Archive destination must not overwrite a source artifact")
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            manifest = {}
+            for path, name in inputs:
+                archive.write(path, name)
+                manifest[name] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
+            archive.writestr("MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        with zipfile.ZipFile(temporary) as archive:
+            bad = archive.testzip()
+            if bad:
+                raise ValueError(f"Archive integrity failure: {bad}")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"Created {destination} ({destination.stat().st_size:,} bytes)")
+
+
+def run(args):
+    """Run every stage with explicit paths; no notebook/manual editing required."""
+    check_training_options(args)
+    check_inputs(Path(args.data_dir))
+    if importlib.util.find_spec("reportlab") is None:
+        raise ValueError("Install requirements-docs.txt before an end-to-end run")
+    if not args.team.strip() or not args.members.strip():
+        raise ValueError("Provide nonempty --team and --members for the methodology")
+    train(args)
+    predict(args)
+    validate(args)
+    output = Path(args.output_dir)
+    args.methodology = str(output / "Documentation_template.md")
+    args.approach_pdf = str(output / "pdf/Approach.pdf")
+    subprocess.run([sys.executable, str(ROOT / "src/build_document.py"),
+                    "--team", args.team, "--members", args.members,
+                    "--report", str(Path(args.work_dir) / "evaluation.json"),
+                    "--prediction-stats", str(output / "prediction_stats.json"),
+                    "--markdown-output", args.methodology, "--output", args.approach_pdf], check=True)
+    package(args)
+
+
+def reproduce(args):
+    """Use an extracted package's model or retrain with its saved original settings."""
+    work = Path(args.work_dir)
+    check_inputs(Path(args.data_dir))
+    expected_inputs = json.loads((work / "input_manifest.json").read_text())
+    if input_manifest(Path(args.data_dir)) != expected_inputs:
+        raise ValueError("Input dataset differs from the packaged input manifest")
+    expected_outputs = json.loads((work / "expected_outputs.json").read_text())
+    args.preserve_expected_outputs = True
+    if args.retrain:
+        config = json.loads((work / "training_config.json").read_text())
+        if config.get("schema_version") != 1:
+            raise ValueError("Unsupported training configuration schema")
+        for key in TRAIN_OPTIONS:
+            setattr(args, key, config[key])
+        args.report = str(work / "reproduced_evaluation.json")
+        train(args)
+    predict(args)
+    validate(args)
+    actual = {name: sha256_file(Path(args.output_dir) / name) for name in expected_outputs}
+    result = {"status": "PASS" if actual == expected_outputs else "DIFFERENT",
+              "retrained": args.retrain, "expected": expected_outputs, "actual": actual}
+    dump_json(Path(args.output_dir) / "reproduction.json", result)
+    if result["status"] != "PASS":
+        raise ValueError("Reproduced TSVs differ; inspect reproduction.json for hashes")
+    print("PASS: both regenerated TSVs match the packaged output hashes")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("train", "predict", "validate", "package"):
+    for command in ("train", "predict", "validate", "package", "run", "reproduce"):
         p = sub.add_parser(command)
         p.add_argument("--data-dir", required=True, help="Directory containing train/ and test/")
         p.add_argument("--work-dir", default="artifacts")
         p.add_argument("--output-dir", default="output")
         p.add_argument("--threads", type=int, default=4)
         p.set_defaults(func=globals()[command])
-        if command == "train":
+        if command in ("train", "run"):
             p.add_argument("--sample-mod", type=int, default=1000)
             p.add_argument("--sample-keep", type=int, default=20)
             p.add_argument("--top-k", type=int, default=12)
             p.add_argument("--block-cap", type=int, default=64)
             p.add_argument("--iterations", type=int, default=600)
             p.add_argument("--report", default="reports/evaluation.json")
-        if command == "package":
-            p.add_argument("--destination", default="output/EntityMatch_submission.zip")
+            p.add_argument("--data-label", choices=("provided", "synthetic"), default="provided")
+        if command in ("package", "run"):
+            p.add_argument("--destination", default=None)
+            p.add_argument("--methodology", default=None)
+            p.add_argument("--approach-pdf", default=None)
+        if command == "run":
+            p.add_argument("--team", required=True)
+            p.add_argument("--members", required=True)
+        if command == "reproduce":
+            p.add_argument("--retrain", action="store_true")
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be positive")

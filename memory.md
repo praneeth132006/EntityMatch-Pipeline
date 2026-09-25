@@ -76,3 +76,18 @@ Code-first checkpoint complete, locally tested, and pushed. Full-data execution 
 - Final documentation-only checkpoint records successful local and CI checks. Consult `git log` for that commit hash.
 - A local code-only archive is available at output/EntityMatch_code_checkpoint.zip, generated from committed sources and checked for ZIP integrity. It is NOT the competition submission ZIP.
 - Final local native warning check completed without warnings; 17 tests passed in 4.34 seconds.
+
+
+## Full-code completion update — 2026-09-25
+- User requested completion of the full code. They briefly suggested Go/Rust, then explicitly withdrew that request and asked to continue with Python. Keep the Python orchestration and existing native C++ retriever; do not migrate languages.
+- Full competition-data execution is still deferred. This phase completes and verifies the code, including all final delivery stages, using synthetic data.
+- Added `run`: checks inputs/options/dependencies, trains, predicts, validates, generates the two-page methodology at explicit output paths, and builds the ZIP.
+- Added `reproduce`: verifies dataset hashes, regenerates TSVs from the packaged model, or retrains from exact saved settings with `--retrain`, then validates and compares original output hashes.
+- ZIP now includes model, exact training options, evaluation, input/output fingerprints, and SHA-256 manifest. It rejects mismatched model/report/output identities and checks ZIP integrity before replacement.
+- Fixed implicit document paths and stale-PDF inclusion: run uses its output directory; standalone package includes only an explicitly selected PDF.
+- Native candidate stream now includes full reference/target counts and preliminary-pair totals (EMATCH02). Reports include candidate reduction ratio and actual corpus sizes.
+- Native build cache is keyed by source content and compile options, not only mtime. Threshold search includes predict-all and predict-none boundaries.
+- Document generator accepts explicit Markdown/PDF paths, labels synthetic runs prominently, and enforces exactly two pages.
+- The reference draft PDF was not replaced with synthetic results. Temporary synthetic PDFs are used only for testing.
+- 22 local tests passed, including full run -> ZIP extraction -> packaged-model reproduction and retraining reproduction. Both reproduced TSVs matched byte-for-byte. Full-data performance remains unmeasured.
+- Next code commit contains this completion update; consult git log for its exact identifier. Retain the earlier full-data continuation checklist.

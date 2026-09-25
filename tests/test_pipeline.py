@@ -149,9 +149,8 @@ def test_end_to_end_synthetic_training_and_prediction(tmp_path):
             write_tsv(data / split / "train_ground_truth.tsv", ["source1_entity_id", "matched_entity_ids"], truth)
     command = [sys.executable, str(ROOT / "src/pipeline.py")]
     common = ["--data-dir", str(data), "--work-dir", str(work), "--output-dir", str(output)]
-    subprocess.run(command + ["train"] + common + ["--sample-mod", "1", "--sample-keep", "1", "--iterations", "30", "--report", str(tmp_path / "report.json")], check=True)
-    subprocess.run(command + ["predict"] + common, check=True)
-    subprocess.run(command + ["validate"] + common, check=True)
+    subprocess.run(command + ["run"] + common + ["--sample-mod", "1", "--sample-keep", "1", "--iterations", "30", "--report", str(tmp_path / "report.json"),
+                   "--team", "Synthetic test team", "--members", "Synthetic test member", "--data-label", "synthetic"], check=True)
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["holdout"]["entities"] > 0
     assert report["holdout"]["blocking_pair_recall"] == 1.0
@@ -160,6 +159,37 @@ def test_end_to_end_synthetic_training_and_prediction(tmp_path):
     assert stats["entities"] == 180
     assert stats["by_country"]["france"]["entities"] == 180
     assert stats["candidate_pairs"] > stats["matched_pairs"] >= 180
+    assert stats["retrieval"]["reference_count"] == 180
+    assert stats["retrieval"]["target_count"] == 360
+    assert 0 < stats["candidate_reduction_ratio"] < 1
+    # The delivered code works independently of the original checkout.
+    import zipfile
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(output / "EntityMatch_submission.zip") as archive:
+        assert archive.testzip() is None
+        manifest = json.loads(archive.read("MANIFEST.json"))
+        import hashlib
+        for name, entry in manifest.items():
+            assert hashlib.sha256(archive.read(name)).hexdigest() == entry["sha256"]
+        archive.extractall(extracted)
+    code = extracted / "code/business_entity_resolution"
+    script = code / "src/pipeline.py"
+    generated = tmp_path / "reproduced"
+    for extra in ([], ["--retrain"]):
+        subprocess.run([sys.executable, str(script), "reproduce", "--data-dir", str(data),
+                        "--output-dir", str(generated), *extra], cwd=code, check=True)
+        assert json.loads((generated / "reproduction.json").read_text())["status"] == "PASS"
+        for filename in ("matching_results.tsv", "candidate_pairs.tsv"):
+            assert (generated / filename).read_bytes() == (output / filename).read_bytes()
+    assert "SYNTHETIC VERIFICATION ONLY" in (output / "Documentation_template.md").read_text()
+    # Valid-looking edits must still be rejected if they differ from model output.
+    (output / "matching_results.tsv").write_text("source1_entity_id\tmatched_entity_ids\n" + "".join(f"S1-{i}\t\n" for i in range(180)))
+    args = argparse.Namespace(data_dir=str(data), work_dir=str(work), output_dir=str(output),
+                             destination=str(tmp_path / "bad.zip"),
+                             methodology=str(output / "Documentation_template.md"), approach_pdf=None)
+    with pytest.raises(ValueError, match="changed since model inference"):
+        pipeline.package(args)
+
 
 
 def test_quoted_tsv_fields(tmp_path, work):
@@ -186,32 +216,40 @@ def test_validator_rejects_duplicate_references(tmp_path):
         pipeline.validate(args)
 
 
-def test_packaging_contract(tmp_path, monkeypatch):
-    import zipfile
+def test_packaging_rejects_draft(tmp_path, monkeypatch):
     args = validation_fixture(tmp_path)
-    pipeline.validate(args)
     project = tmp_path / "project"
-    (project / "src").mkdir(parents=True)
-    (project / "tests").mkdir()
-    for name in ("README.md", "requirements.txt", "requirements-lock.txt", "requirements-docs.txt", "LICENSE", "memory.md", "requirements-dev.txt"):
-        (project / name).write_text("Synthetic packaging test\n")
-    (project / "src/pipeline.py").write_text("# synthetic packaging fixture\n")
-    (project / "src/retrieve.cpp").write_text("// synthetic packaging fixture\n")
+    project.mkdir()
     (project / "Documentation_template.md").write_text("NOT YET RUN\n")
     monkeypatch.setattr(pipeline, "ROOT", project)
     args.destination = str(tmp_path / "submission.zip")
+    args.work_dir = str(tmp_path / "work")
+    args.methodology = None
+    args.approach_pdf = None
     with pytest.raises(ValueError, match="Finalize the methodology"):
         pipeline.package(args)
-    (project / "Documentation_template.md").write_text("Synthetic test methodology, not competition results\n")
-    pipeline.package(args)
-    with zipfile.ZipFile(args.destination) as archive:
-        assert archive.testzip() is None
-        assert set(archive.namelist()) >= {
-            "output/matching_results.tsv", "output/candidate_pairs.tsv",
-            "code/business_entity_resolution/src/pipeline.py",
-            "code/business_entity_resolution/src/retrieve.cpp",
-            "code/business_entity_resolution/README.md", "Documentation_template.md"}
-    # An old validation PASS must not allow changed invalid output into a package.
+    # A previously valid file must not authorize an invalid replacement.
     (Path(args.output_dir) / "matching_results.tsv").write_text("wrong\n")
     with pytest.raises(ValueError, match="Invalid matching header"):
         pipeline.package(args)
+
+
+def test_threshold_can_predict_none():
+    threshold, score = pipeline.choose_threshold(np.array([0]), np.array([0]), np.array([1.0]),
+                                                 np.array([0]), np.array([True]))
+    assert threshold > 1
+    assert score == 1
+
+
+@pytest.mark.parametrize("key,value", [("top_k", 0), ("iterations", -1), ("sample_keep", 1001)])
+def test_invalid_training_settings_fail_before_retrieval(key, value):
+    args = argparse.Namespace(sample_mod=1000, sample_keep=20, top_k=12, block_cap=64,
+                              iterations=600, threads=4, data_label="synthetic")
+    setattr(args, key, value)
+    with pytest.raises(ValueError):
+        pipeline.check_training_options(args)
+
+
+def test_missing_input_fails_early(tmp_path):
+    with pytest.raises(ValueError, match="Missing or empty"):
+        pipeline.check_inputs(tmp_path)

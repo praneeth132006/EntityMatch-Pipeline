@@ -15,3 +15,16 @@
 Full competition execution is deferred at the user's request. There is no measured
 competition score, test output, production runtime, or final submission ZIP yet.
 The committed PDF is an approach draft, not a submission-ready report.
+
+
+## Full workflow completion checks
+
+- **22 local tests passed** after adding run/reproduce and artifact provenance checks.
+- Integration test executes every stage on synthetic records, checks every archive
+  manifest checksum, extracts the ZIP, and regenerates both TSVs from the extracted
+  code using the saved model and again with `--retrain`.
+- Both reproduction modes match the original TSVs byte-for-byte.
+- New checks cover invalid training options, missing inputs, the predict-none threshold,
+  actual retrieval counts/reduction ratio, and rejection of modified inference outputs.
+- C++ warning check remains clean. All PDFs produced by these tests are explicitly
+  marked synthetic and are not committed as competition results.

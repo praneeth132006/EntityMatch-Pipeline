@@ -1,4 +1,5 @@
 catboost==1.2.8
+charset-normalizer==3.5.1
 contourpy==1.4.0
 cycler==0.12.1
 fonttools==4.66.0
@@ -17,5 +18,6 @@ pygments==2.21.0
 pyparsing==3.3.3
 pytest==8.4.2
 python-dateutil==2.9.0.post0
+reportlab==4.4.9
 scipy==1.18.1
 six==1.17.0

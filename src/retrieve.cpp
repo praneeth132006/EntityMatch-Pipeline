@@ -314,6 +314,7 @@ struct Candidate {
   array<float, NF> x;
 };
 void write32(uint32_t x) { cout.write(reinterpret_cast<char *>(&x), 4); }
+void write64(uint64_t x) { cout.write(reinterpret_cast<char *>(&x), 8); }
 void writes(const string &s) {
   write32(s.size());
   cout.write(s.data(), s.size());
@@ -420,9 +421,12 @@ int main(int argc, char **argv) {
                << " plausible pairs=" << considered << endl;
       }
     }
-    cout.write("EMATCH01", 8);
+    cout.write("EMATCH02", 8);
     write32(candidates.size());
     write32(NF);
+    write64(refs.size());
+    write64(seen);
+    write64(considered);
     uint64_t count = 0;
     for (size_t i = 0; i < refs.size(); ++i)
       if (active[i] >= 0) {

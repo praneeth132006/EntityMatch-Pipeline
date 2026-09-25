@@ -10,3 +10,4 @@ output/*.gz
 output/*.zip
 catboost_info/
 *.log
+*.tmp

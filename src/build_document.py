@@ -13,8 +13,10 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, PageBreak, KeepToge
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def build(team, members, report_path, destination):
+def build(team, members, report_path, destination, markdown_path=None, prediction_path=None):
     report = json.loads(report_path.read_text()) if report_path.exists() else None
+    prediction = json.loads(prediction_path.read_text()) if prediction_path and prediction_path.exists() else None
+    markdown_path = markdown_path or ROOT / "Documentation_template.md"
     status = "Measured training holdout; test leaderboard score unknown" if report else "DRAFT - FULL DATA EVALUATION NOT YET RUN"
     identity = f"Project/team: {team} | Members: {members or 'Not yet supplied'} | Date: {date.today().isoformat()}"
     sections = [
@@ -33,6 +35,14 @@ def build(team, members, report_path, destination):
     else:
         sections[5] = (sections[5][0], "NOT YET RUN: no competition holdout score, candidate recall, runtime, or leaderboard result is available. Full-data execution was deferred at the user's request after a low-disk-space warning. Synthetic tests establish functional behavior only. Likely failure modes include true links lost through heavy corruption, country disagreements, frequent-key exclusion or top-k truncation, and false merges for shared names/addresses. France has no labeled training examples, so France accuracy cannot be inferred from a US/India holdout.")
     if report:
+        counts = report.get("retrieval", {})
+        overview = (f"The measured training corpus contains {counts.get('reference_count', 0):,} references "
+                    f"and {counts.get('target_count', 0):,} target records.")
+        if prediction:
+            overview += (f" The prediction corpus contains {prediction['entities']:,} references and "
+                         f"{prediction['retrieval']['target_count']:,} target records.")
+        noise = "Names and addresses" + sections[1][1].split("Names and addresses", 1)[1]
+        sections[1] = (sections[1][0], overview + " " + noise)
         replacements = {
             "more than 64": f"more than {report['block_cap']}",
             "at most 12": f"at most {report['top_k']}",
@@ -41,10 +51,13 @@ def build(team, members, report_path, destination):
         }
         for old, new in replacements.items():
             sections = [(title, body.replace(old, new)) for title, body in sections]
+        if report.get("data_label") == "synthetic":
+            status = "SYNTHETIC VERIFICATION ONLY - NOT COMPETITION RESULTS"
+            sections[5] = (sections[5][0], "All measurements below use synthetic test records. " + sections[5][1])
     markdown = ["# ML Challenge 2026: Business Entity Resolution", "", f"**Status:** {status}", "", identity, ""]
     for title, body in sections:
         markdown.extend([f"## {title}", "", body, ""])
-    (ROOT / "Documentation_template.md").write_text("\n".join(markdown), encoding="utf-8")
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="BodyCustom", fontName="Helvetica", fontSize=9.4, leading=13, spaceAfter=9, textColor=colors.HexColor("#243347")))
@@ -62,8 +75,17 @@ def build(team, members, report_path, destination):
         canvas.setFillColor(colors.HexColor("#536276"))
         canvas.drawString(42, 24, "EntityMatch | Provided-data-only pipeline")
         canvas.drawRightString(553, 24, f"{doc.page}")
-    SimpleDocTemplate(str(destination), pagesize=(595.28, 841.89), rightMargin=42, leftMargin=42,
-                      topMargin=34, bottomMargin=48, title="EntityMatch approach", author=team).build(story, onFirstPage=footer, onLaterPages=footer)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        document = SimpleDocTemplate(str(temporary), pagesize=(595.28, 841.89), rightMargin=42, leftMargin=42,
+                                     topMargin=34, bottomMargin=48, title="EntityMatch approach", author=team)
+        document.build(story, onFirstPage=footer, onLaterPages=footer)
+        if document.page != 2:
+            raise ValueError(f"Approach must be two pages; generated {document.page}. Shorten team details or text.")
+        temporary.replace(destination)
+        markdown_path.write_text("\n".join(markdown), encoding="utf-8")
+    finally:
+        temporary.unlink(missing_ok=True)
     print(destination)
 
 
@@ -73,5 +95,7 @@ if __name__ == "__main__":
     p.add_argument("--members", default="")
     p.add_argument("--report", type=Path, default=ROOT / "reports/evaluation.json")
     p.add_argument("--output", type=Path, default=ROOT / "output/pdf/Approach.pdf")
+    p.add_argument("--markdown-output", type=Path, default=ROOT / "Documentation_template.md")
+    p.add_argument("--prediction-stats", type=Path)
     args = p.parse_args()
-    build(args.team, args.members, args.report, args.output)
+    build(args.team, args.members, args.report, args.output, args.markdown_output, args.prediction_stats)
