@@ -28,3 +28,9 @@ The committed PDF is an approach draft, not a submission-ready report.
   actual retrieval counts/reduction ratio, and rejection of modified inference outputs.
 - C++ warning check remains clean. All PDFs produced by these tests are explicitly
   marked synthetic and are not committed as competition results.
+
+- GitHub CI passed for full-workflow commit `01217c7`:
+  https://github.com/praneeth132006/EntityMatch-Pipeline/actions/runs/36156192385.
+- Organizer-provided validator passed with `--check-ids` on the synthetic archive
+  outputs: 180 required references, 360 valid target IDs. No competition data was run.
+- Both pages of the updated document generator's synthetic output were visually reviewed.

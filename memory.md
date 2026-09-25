@@ -34,7 +34,7 @@
 - Asked user for team/member names; project/package name defaults to EntityMatch.
 
 ## Current status
-Code-first checkpoint complete, locally tested, and pushed. Full-data execution remains deferred; no competition score or final submission is claimed.
+Full workflow code is complete and tested locally and in GitHub CI, including archive extraction and exact-output reproduction. Full competition-data execution remains deferred; no competition score or final competition submission is claimed.
 
 ## Scope update
 - User explicitly said: "u write the code 1st later we will continue with this" after the disk-space warning.
@@ -91,3 +91,9 @@ Code-first checkpoint complete, locally tested, and pushed. Full-data execution 
 - The reference draft PDF was not replaced with synthetic results. Temporary synthetic PDFs are used only for testing.
 - 22 local tests passed, including full run -> ZIP extraction -> packaged-model reproduction and retraining reproduction. Both reproduced TSVs matched byte-for-byte. Full-data performance remains unmeasured.
 - Next code commit contains this completion update; consult git log for its exact identifier. Retain the earlier full-data continuation checklist.
+
+- Completion implementation commit: `01217c7`, pushed to main.
+- GitHub Actions run 36156192385 passed for that commit: https://github.com/praneeth132006/EntityMatch-Pipeline/actions/runs/36156192385.
+- Organizer validator passed on the synthetic archive outputs with `--check-ids`: all 180 Source 1 rows covered, 360 valid target IDs checked. This is format verification, not a competition score.
+- Latest local test run: 22 passed in 6.06 seconds. The updated generator's synthetic PDF was rendered and both pages visually checked; no clipping/overlap found.
+- Refreshed local `output/EntityMatch_code_checkpoint.zip` from the final committed tree. The archive is source code plus the clearly labeled pending approach draft, not the final competition-data submission.
