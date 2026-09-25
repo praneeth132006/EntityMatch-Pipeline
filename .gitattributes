@@ -1,0 +1,7 @@
+*.pdf binary
+*.zip binary
+*.png binary
+*.py text eol=lf
+*.cpp text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
