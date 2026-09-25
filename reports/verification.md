@@ -7,7 +7,9 @@
   exact macro F0.5 and singletons; threshold/holdout isolation; full synthetic
   training/prediction/validation; invalid submission rejection; archive structure;
   refusal to package unfinished methodology or trust stale validation.
-- Additional check: native source compiled with `-Wall -Wextra -Wpedantic`.
+- Additional check: native source compiled with `-Wall -Wextra -Wpedantic` without warnings.
+- GitHub Actions: Ubuntu workflow passed for code commit `cdb3d02`; run
+  https://github.com/praneeth132006/EntityMatch-Pipeline/actions/runs/36151096121.
 - Approach draft: two PDF pages; both visually reviewed.
 
 Full competition execution is deferred at the user's request. There is no measured

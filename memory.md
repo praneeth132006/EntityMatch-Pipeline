@@ -34,7 +34,7 @@
 - Asked user for team/member names; project/package name defaults to EntityMatch.
 
 ## Current status
-Implementation in progress. No model score or finished submission is claimed yet.
+Code-first checkpoint complete, locally tested, and pushed. Full-data execution remains deferred; no competition score or final submission is claimed.
 
 ## Scope update
 - User explicitly said: "u write the code 1st later we will continue with this" after the disk-space warning.
@@ -71,4 +71,8 @@ Implementation in progress. No model score or finished submission is claimed yet
 
 ## Git history
 - `fe73cf8`: initialized project requirements and memory; pushed to main.
-- Implementation, tests, methodology draft, and continuation instructions are included in the next code checkpoint commit. Use `git log` for its exact hash.
+- `cdb3d02`: implemented native retrieval, pipeline CLI, 17 tests, pinned environment, documentation draft, and continuation instructions; pushed to main.
+- GitHub Actions run 36151096121 passed on Ubuntu for cdb3d02: https://github.com/praneeth132006/EntityMatch-Pipeline/actions/runs/36151096121
+- Final documentation-only checkpoint records successful local and CI checks. Consult `git log` for that commit hash.
+- A local code-only archive is available at output/EntityMatch_code_checkpoint.zip, generated from committed sources and checked for ZIP integrity. It is NOT the competition submission ZIP.
+- Final local native warning check completed without warnings; 17 tests passed in 4.34 seconds.
