@@ -139,9 +139,15 @@ def test_end_to_end_synthetic_training_and_prediction(tmp_path):
             name = f"Synthetic venture {i} laboratories"
             address = f"{i + 100} Orchard road District{i}"
             refs.append([f"S1-{i}", name, address, country])
-            positives.append([f"S2-{i}", name + " Inc", address.replace("road", "rd"), country])
+            matched = []
+            if i % 10:  # Include real singletons in the complete workflow.
+                positives.append([f"S2-{i}", name + " Inc", address.replace("road", "rd"), country])
+                matched.append(f"S2-{i}")
+                if i % 7 == 0:
+                    negatives.append([f"S3-match-{i}", name + " Ltd", address, country])
+                    matched.append(f"S3-match-{i}")
             negatives.append([f"S3-{i}", name, f"{i+9000} Distant lane Elsewhere", country])
-            truth.append([f"S1-{i}", f"S2-{i}"])
+            truth.append([f"S1-{i}", ",".join(matched)])
         write_tsv(data / split / f"{split}_source1.tsv", HEADER, refs)
         write_tsv(data / split / f"{split}_source2.tsv", HEADER, positives)
         write_tsv(data / split / f"{split}_source3.tsv", HEADER, negatives)
@@ -159,8 +165,13 @@ def test_end_to_end_synthetic_training_and_prediction(tmp_path):
     assert stats["entities"] == 180
     assert stats["by_country"]["france"]["entities"] == 180
     assert stats["candidate_pairs"] > stats["matched_pairs"] >= 180
+    assert report["holdout"]["singleton_entities"] > 0
+    with (output / "matching_results.tsv").open() as stream:
+        predicted = {row[0]: row[1] for row in list(csv.reader(stream, delimiter="\t"))[1:]}
+    assert predicted["S1-0"] == ""
+    assert {"S2-7", "S3-match-7"}.issubset(predicted["S1-7"].split(","))
     assert stats["retrieval"]["reference_count"] == 180
-    assert stats["retrieval"]["target_count"] == 360
+    assert stats["retrieval"]["target_count"] == len(positives) + len(negatives)
     assert 0 < stats["candidate_reduction_ratio"] < 1
     # The delivered code works independently of the original checkout.
     import zipfile
@@ -189,6 +200,20 @@ def test_end_to_end_synthetic_training_and_prediction(tmp_path):
                              methodology=str(output / "Documentation_template.md"), approach_pdf=None)
     with pytest.raises(ValueError, match="changed since model inference"):
         pipeline.package(args)
+    # Prediction can use a newly provided test set; its provenance must follow it.
+    import shutil
+    alternate = tmp_path / "alternate-data"
+    shutil.copytree(data, alternate)
+    source = alternate / "test/test_source2.tsv"
+    source.write_text(source.read_text().replace("Orchard", "Alternate", 1))
+    alternate_output = tmp_path / "alternate-output"
+    subprocess.run(command + ["predict", "--data-dir", str(alternate), "--work-dir", str(work),
+                              "--output-dir", str(alternate_output)], check=True)
+    assert json.loads((work / "input_manifest.json").read_text()) == pipeline.input_manifest(alternate)
+    args.output_dir = str(alternate_output)
+    with pytest.raises(ValueError, match="differs from the training/prediction manifest"):
+        pipeline.package(args)
+
 
 
 
@@ -253,3 +278,59 @@ def test_invalid_training_settings_fail_before_retrieval(key, value):
 def test_missing_input_fails_early(tmp_path):
     with pytest.raises(ValueError, match="Missing or empty"):
         pipeline.check_inputs(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["work_dir", "output_dir", "report", "destination"])
+def test_cannot_write_into_original_dataset(tmp_path, field):
+    data = tmp_path / "data"
+    data.mkdir()
+    args = argparse.Namespace(data_dir=str(data))
+    setattr(args, field, str(data / "accidental-output"))
+    with pytest.raises(ValueError, match="outside the input dataset"):
+        pipeline.check_write_paths(args)
+
+
+def test_symlink_cannot_bypass_dataset_protection(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(data, target_is_directory=True)
+    args = argparse.Namespace(data_dir=str(data), output_dir=str(alias / "output"))
+    with pytest.raises(ValueError, match="outside the input dataset"):
+        pipeline.check_write_paths(args)
+
+
+@pytest.mark.parametrize("text", ["S2-", "S2-1,", "S2-1,S2-1", "S2- 1", 'S3-a"', "S3-a\x00"])
+def test_strict_target_id_lists(text):
+    with pytest.raises(ValueError, match="invalid target"):
+        pipeline.parse_target_ids(text)
+
+
+def test_empty_submission_has_readable_error(tmp_path):
+    args = validation_fixture(tmp_path)
+    (Path(args.output_dir) / "matching_results.tsv").write_text("")
+    with pytest.raises(ValueError, match="Invalid matching header"):
+        pipeline.validate(args)
+
+
+def test_invalid_source_header_clears_stale_pass(tmp_path):
+    args = validation_fixture(tmp_path)
+    pipeline.validate(args)
+    report = Path(args.output_dir) / "validation.json"
+    assert report.exists()
+    (Path(args.data_dir) / "test/test_source2.tsv").write_text("wrong\n")
+    with pytest.raises(ValueError, match="Unexpected Source 2 header"):
+        pipeline.validate(args)
+    assert not report.exists()
+
+
+def test_manifest_tracks_only_required_files_and_selected_split(tmp_path):
+    args = validation_fixture(tmp_path)
+    data = Path(args.data_dir)
+    before = pipeline.input_manifest(data, ("test",))
+    assert len(before) == 3
+    (data / "test/unrelated.tsv").write_text("notes\n")
+    assert pipeline.input_manifest(data, ("test",)) == before
+    path = data / "test/test_source1.tsv"
+    path.write_text(path.read_text().replace("Alpha", "Beta"))
+    assert pipeline.input_manifest(data, ("test",)) != before

@@ -242,3 +242,19 @@ reproduction are exercised by the integration test.
 
 For synthetic verification runs, set `--data-label synthetic` on `train` or `run`.
 The generated report and document then explicitly label results as synthetic.
+
+## Completion and input integrity
+
+See `reports/code-completion.md` for the implemented requirement checklist. The final
+audit suite includes singletons and multiple true matches in the full pipeline test.
+`pytest.ini` limits discovery to `tests/`, including inside extracted submissions.
+
+Training fingerprints only the required training files; prediction fingerprints the
+actual test files it uses, even when they come from a different dataset directory.
+Packaging checks that the supplied dataset matches both manifests. Extra unrelated
+TSVs do not affect reproduction. Generated artifact paths must remain outside the
+input dataset directory, including paths routed through symlinks.
+
+Input headers are checked before a full scan. ID lists reject empty entries,
+duplicates, invalid prefixes, whitespace, and control characters. A failed validation
+removes a previous PASS report so it cannot be mistaken for a current result.

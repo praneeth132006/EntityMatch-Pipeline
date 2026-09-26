@@ -28,6 +28,34 @@ FEATURES = [
 ]
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_OPTIONS = ("sample_mod", "sample_keep", "top_k", "block_cap", "iterations", "threads", "data_label")
+SOURCE_HEADER = ["entity_id", "business_name", "business_address", "country"]
+
+
+def required_inputs(splits=("train", "test")):
+    for split in splits:
+        for source in (1, 2, 3):
+            yield f"{split}/{split}_source{source}.tsv"
+        if split == "train":
+            yield "train/train_ground_truth.tsv"
+
+
+def check_write_paths(args):
+    """Keep generated artifacts outside the supplied, read-only dataset tree."""
+    data = Path(args.data_dir).resolve()
+    for key in ("work_dir", "output_dir", "report", "destination"):
+        value = getattr(args, key, None)
+        if value and Path(value).resolve().is_relative_to(data):
+            raise ValueError(f"{key} must be outside the input dataset directory")
+
+
+def parse_target_ids(text):
+    ids = text.split(",") if text else []
+    if len(ids) != len(set(ids)) or any(
+        not x.startswith(("S2-", "S3-")) or len(x) <= 3
+        or any(c.isspace() or ord(c) < 32 or ord(c) == 34 for c in x) for x in ids
+    ):
+        raise ValueError("Duplicate or invalid target IDs")
+    return ids
 
 
 def sha256_file(path):
@@ -40,14 +68,14 @@ def sha256_file(path):
 
 def check_inputs(data, splits=("train", "test")):
     """Fail before indexing a large corpus if any required input is missing."""
-    for split in splits:
-        names = [f"{split}_source{i}.tsv" for i in (1, 2, 3)]
-        if split == "train":
-            names.append("train_ground_truth.tsv")
-        for name in names:
-            path = Path(data) / split / name
-            if not path.is_file() or path.stat().st_size == 0:
-                raise ValueError(f"Missing or empty input file: {path}")
+    for name in required_inputs(splits):
+        path = Path(data) / name
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f"Missing or empty input file: {path}")
+        with path.open(newline="", encoding="utf-8") as stream:
+            expected = ["source1_entity_id", "matched_entity_ids"] if "ground_truth" in name else SOURCE_HEADER
+            if next(csv.reader(stream, delimiter="\t"), None) != expected:
+                raise ValueError(f"Unexpected input header: {path}")
 
 
 def check_training_options(args):
@@ -170,18 +198,17 @@ def choose_threshold(groups, labels, probabilities, true_counts, mask):
     return best[1], best[0]
 
 
-def input_manifest(data):
-    manifest = {}
-    for split in ("train", "test"):
-        for path in sorted((data / split).glob("*.tsv")):
-            manifest[f"{split}/{path.name}"] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
-    return manifest
+def input_manifest(data, splits=("train", "test")):
+    return {name: {"bytes": (Path(data) / name).stat().st_size,
+                   "sha256": sha256_file(Path(data) / name)}
+            for name in required_inputs(splits)}
 
 
 def train(args):
     from catboost import CatBoostClassifier
     start = time.monotonic()
     work, data = Path(args.work_dir), Path(args.data_dir)
+    check_write_paths(args)
     check_training_options(args)
     check_inputs(data, ("train",))
     retrieval_stats = {}
@@ -204,11 +231,13 @@ def train(args):
         if reader.fieldnames != ["source1_entity_id", "matched_entity_ids"]:
             raise ValueError("Unexpected ground truth header")
         for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError("Malformed ground truth TSV row")
             i = ref_lookup.get(row["source1_entity_id"])
             if i is not None:
                 if truth[i] is not None:
                     raise ValueError("Duplicate ground truth reference ID")
-                truth[i] = set(filter(None, row["matched_entity_ids"].split(",")))
+                truth[i] = set(parse_target_ids(row["matched_entity_ids"]))
     if any(t is None for t in truth):
         raise ValueError("Ground truth does not cover sampled reference entities")
     x = np.concatenate(blocks)
@@ -290,13 +319,14 @@ def train(args):
     dump_json(Path(args.report), report)
     dump_json(work / "evaluation.json", report)
     dump_json(work / "training_config.json", {"schema_version": 1, **{key: getattr(args, key) for key in TRAIN_OPTIONS}})
-    dump_json(work / "input_manifest.json", input_manifest(data))
+    dump_json(work / "input_manifest.json", input_manifest(data, ("train",)))
     print(json.dumps({"holdout": report["holdout"], "threshold": threshold}, indent=2))
 
 
 def predict(args):
     from catboost import CatBoostClassifier
     work, output = Path(args.work_dir), Path(args.output_dir)
+    check_write_paths(args)
     check_inputs(Path(args.data_dir), ("test",))
     config = json.loads((work / "model_config.json").read_text())
     if config["features"] != FEATURES:
@@ -351,22 +381,30 @@ def predict(args):
     dump_json(output / "prediction_stats.json", stats)
     if not getattr(args, "preserve_expected_outputs", False):
         dump_json(work / "expected_outputs.json", stats["output_sha256"])
+    manifest_path = work / "input_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest = {key: value for key, value in manifest.items() if key.startswith("train/")}
+    manifest.update(input_manifest(Path(args.data_dir), ("test",)))
+    dump_json(manifest_path, manifest)
     print(json.dumps(stats, indent=2))
 
 
 def validate(args):
     """Streaming validation plus exact target-ID membership using only referenced IDs."""
     data, output = Path(args.data_dir), Path(args.output_dir)
+    check_write_paths(args)
+    # Do not leave a stale PASS report after a failed subsequent validation.
+    (output / "validation.json").unlink(missing_ok=True)
     requested = set()
     seen = set()
     rows = 0
     with (data / "test" / "test_source1.tsv").open(encoding="utf-8", newline="") as source, (output / "matching_results.tsv").open(encoding="utf-8", newline="") as mf, (output / "candidate_pairs.tsv").open(encoding="utf-8", newline="") as cf:
         sr, mr, cr = (csv.reader(s, delimiter="\t") for s in (source, mf, cf))
-        if next(sr) != ["entity_id", "business_name", "business_address", "country"]:
+        if next(sr, None) != SOURCE_HEADER:
             raise ValueError("Unexpected Source 1 header")
-        if next(mr) != ["source1_entity_id", "matched_entity_ids"]:
+        if next(mr, None) != ["source1_entity_id", "matched_entity_ids"]:
             raise ValueError("Invalid matching header")
-        if next(cr) != ["source1_entity_id", "candidate_entity_ids"]:
+        if next(cr, None) != ["source1_entity_id", "candidate_entity_ids"]:
             raise ValueError("Invalid candidate header")
         for source_row in sr:
             if len(source_row) != 4 or not source_row[0].startswith("S1-"):
@@ -381,10 +419,7 @@ def validate(args):
                 raise ValueError("Output must have exactly two TSV columns")
             if matching[0] != source_row[0] or candidates[0] != source_row[0]:
                 raise ValueError("Source IDs must match input order exactly")
-            lists = [r[1].split(",") if r[1] else [] for r in (matching, candidates)]
-            for ids in lists:
-                if len(ids) != len(set(ids)) or any(not x.startswith(("S2-", "S3-")) for x in ids):
-                    raise ValueError("Duplicate or invalid target IDs")
+            lists = [parse_target_ids(r[1]) for r in (matching, candidates)]
             if not set(lists[0]).issubset(lists[1]):
                 raise ValueError("A final match was not a scored candidate")
             requested.update(lists[1])
@@ -393,9 +428,13 @@ def validate(args):
             raise ValueError("Extra output rows")
     referenced = len(requested)
     for source in (2, 3):
-        with (data / "test" / f"test_source{source}.tsv").open(encoding="utf-8") as stream:
-            next(stream)
-            for row in csv.reader(stream, delimiter="\t"):
+        with (data / "test" / f"test_source{source}.tsv").open(encoding="utf-8", newline="") as stream:
+            reader = csv.reader(stream, delimiter="\t")
+            if next(reader, None) != SOURCE_HEADER:
+                raise ValueError(f"Unexpected Source {source} header")
+            for row in reader:
+                if len(row) != 4 or not row[0].startswith(f"S{source}-"):
+                    raise ValueError(f"Malformed Source {source} row")
                 requested.discard(row[0])
     if requested:
         raise ValueError(f"Unknown target IDs: {sorted(requested)[:5]}")
@@ -430,12 +469,14 @@ def package(args):
     for name in ("matching_results.tsv", "candidate_pairs.tsv"):
         if sha256_file(output / name) != expected.get(name) or expected.get(name) != stats["output_sha256"].get(name):
             raise ValueError(f"Prediction artifact changed since model inference: {name}")
+    if input_manifest(Path(args.data_dir)) != json.loads((work / "input_manifest.json").read_text()):
+        raise ValueError("Input dataset differs from the training/prediction manifest")
     destination = Path(args.destination) if args.destination else output / "EntityMatch_submission.zip"
     destination.parent.mkdir(parents=True, exist_ok=True)
     inputs = [(output / name, "output/" + name) for name in ("matching_results.tsv", "candidate_pairs.tsv")]
     prefix = "code/business_entity_resolution/"
     inputs += [(path, prefix + "src/" + path.name) for path in sorted((ROOT / "src").glob("*")) if path.is_file() and path.suffix in {".py", ".cpp"}]
-    inputs += [(ROOT / name, prefix + name) for name in ("README.md", "requirements.txt", "requirements-lock.txt", "requirements-docs.txt", "requirements-dev.txt", "LICENSE", "memory.md")]
+    inputs += [(ROOT / name, prefix + name) for name in ("README.md", "requirements.txt", "requirements-lock.txt", "requirements-docs.txt", "requirements-dev.txt", "pytest.ini", "LICENSE", "memory.md")]
     inputs += [(path, prefix + "tests/" + path.name) for path in sorted((ROOT / "tests").glob("test_*.py"))]
     inputs += [(work / name, prefix + "artifacts/" + name) for name in artifact_names]
     inputs += [(methodology, "Documentation_template.md"), (methodology, prefix + "Documentation_template.md"),
@@ -469,6 +510,7 @@ def package(args):
 def run(args):
     """Run every stage with explicit paths; no notebook/manual editing required."""
     check_training_options(args)
+    check_write_paths(args)
     check_inputs(Path(args.data_dir))
     if importlib.util.find_spec("reportlab") is None:
         raise ValueError("Install requirements-docs.txt before an end-to-end run")
@@ -491,6 +533,7 @@ def run(args):
 def reproduce(args):
     """Use an extracted package's model or retrain with its saved original settings."""
     work = Path(args.work_dir)
+    check_write_paths(args)
     check_inputs(Path(args.data_dir))
     expected_inputs = json.loads((work / "input_manifest.json").read_text())
     if input_manifest(Path(args.data_dir)) != expected_inputs:

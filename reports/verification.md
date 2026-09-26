@@ -34,3 +34,14 @@ The committed PDF is an approach draft, not a submission-ready report.
 - Organizer-provided validator passed with `--check-ids` on the synthetic archive
   outputs: 180 required references, 360 valid target IDs. No competition data was run.
 - Both pages of the updated document generator's synthetic output were visually reviewed.
+
+## Final coding audit — 2026-09-26
+
+- **36 tests passed locally in 6.61 seconds**, including end-to-end singletons,
+  multiple matches, extracted-model reproduction, and retraining reproduction.
+- Added checks for changed test-directory provenance, input-path protection through
+  symlinks, malformed headers/ID lists, and invalidation of stale PASS reports.
+- Pytest discovery is now confined to tests/ so previous extracted archives cannot
+  interfere with subsequent test runs.
+- The organizer validator is no longer available at the original resource path;
+  its earlier pass is historical and was not repeated during this audit.

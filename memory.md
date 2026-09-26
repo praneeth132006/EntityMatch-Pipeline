@@ -97,3 +97,16 @@ Full workflow code is complete and tested locally and in GitHub CI, including ar
 - Organizer validator passed on the synthetic archive outputs with `--check-ids`: all 180 Source 1 rows covered, 360 valid target IDs checked. This is format verification, not a competition score.
 - Latest local test run: 22 passed in 6.06 seconds. The updated generator's synthetic PDF was rendered and both pages visually checked; no clipping/overlap found.
 - Refreshed local `output/EntityMatch_code_checkpoint.zip` from the final committed tree. The archive is source code plus the clearly labeled pending approach draft, not the final competition-data submission.
+
+## Final coding audit — 2026-09-26
+- User reiterated that the coding part must be complete. Continued the code-only scope; full competition execution remains deferred.
+- Audited every CLI stage and its failure paths; no TODO/NotImplemented stubs remain.
+- Fixed dataset provenance: train fingerprints required train files; predict fingerprints the actual test directory; package rejects a supplied dataset inconsistent with either. Unrelated TSVs are ignored.
+- Added read-only dataset path protection (including symlinks), early header validation, strict target-list parsing, malformed ground-truth checks, and stale-PASS report removal after validation failure.
+- Fixed a real repeat-test failure: pytest was discovering tests in old extracted ZIPs. Added pytest.ini and included it in submission packages.
+- Expanded end-to-end fixtures to include 18 singletons and multiple true matches, plus regression coverage for changed prediction datasets, path protection, and malformed inputs.
+- Latest local result: 36 passed in 6.61 seconds; native C++ warning check clean. Both saved-model and retraining reproduction still regenerate identical TSVs.
+- Repaired a local pandas binary-loading failure by reinstalling the same pinned pandas 3.0.6 wheel. No package versions changed. Bootstrapped pip into the local ignored venv because uv was not starting.
+- The original student_resource folder/organizer validator is no longer present at its supplied path. A bounded Downloads search did not find train_source1.tsv or validate_submission.py. Restore/provide the original resource before the deferred competition run. Did not delete or move it.
+- Therefore the organizer validator was NOT rerun successfully in this audit; earlier synthetic validator passes remain recorded above.
+- Added reports/code-completion.md mapping every requirement to implemented code and verification. Remaining work is real-data execution and team metadata, not unimplemented code.
