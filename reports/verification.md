@@ -45,3 +45,5 @@ The committed PDF is an approach draft, not a submission-ready report.
   interfere with subsequent test runs.
 - The organizer validator is no longer available at the original resource path;
   its earlier pass is historical and was not repeated during this audit.
+- GitHub CI passed the final audited code (`3d444f7`) on Ubuntu:
+  https://github.com/praneeth132006/EntityMatch-Pipeline/actions/runs/36232919221.
